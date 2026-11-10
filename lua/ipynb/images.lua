@@ -197,6 +197,9 @@ end
 -- Storage for snacks Image objects (keep them alive for the terminal protocol)
 local image_cache = {} ---@type table<string, snacks.Image>
 
+-- Makes retry file names unique (see get_image_virt_lines)
+local retry_counter = 0
+
 ---Get or create a snacks Image object for a file path
 ---@param path string Path to image file
 ---@return snacks.Image|nil
@@ -337,36 +340,47 @@ function M.get_image_virt_lines(state, cell, output, image_index, opts)
 	local filename = string.format("%s-%d-%s%s.%s", cell_id, image_index, data_hash, opts and opts.view and "-view" or "", ext)
 	local path = cache_dir .. "/" .. filename
 
-	if not write_binary_file(path, file_content) then
-		return nil, 0
+	-- Snacks keeps every Image object in a session-long table keyed by file path. One that failed, or
+	-- never received its info (e.g. its conversion raced with the file being rewritten or deleted by
+	-- another render), is handed back for that path forever, so the figure could never load again.
+	-- When that happens, retry under a fresh file name instead of failing for good.
+	local base_name = (filename:gsub("%.[^.]+$", ""))
+	local img, native_width_px, native_height_px
+	for attempt = 0, 2 do
+		if attempt > 0 then
+			image_cache[path] = nil
+			pcall(vim.fn.delete, path)
+			retry_counter = retry_counter + 1
+			path = string.format("%s/%s-r%d-%d.%s", cache_dir, base_name, vim.fn.getpid(), retry_counter, ext)
+		end
+
+		if not write_binary_file(path, file_content) then
+			return nil, 0
+		end
+
+		-- File content may have changed between executions for the same cell/image index.
+		-- Drop cached object so snacks reloads fresh bytes from disk.
+		image_cache[path] = nil
+
+		-- Get or create snacks Image (handles sending image data to terminal)
+		img = get_or_create_image(path)
+		if img then
+			-- Wait for image to be ready (it may need conversion). Snacks fills in `info` from a
+			-- scheduled callback just after ready() turns true, so wait for that too.
+			local ready = vim.wait(500, function()
+				return img:failed() or (img:ready() and img.info ~= nil)
+			end, 10)
+
+			-- Get dimensions from snacks' converted image
+			if ready and not img:failed() and img.info and img.info.size and img.info.size.width and img.info.size.height then
+				native_width_px = img.info.size.width
+				native_height_px = img.info.size.height
+				break
+			end
+		end
+		img = nil
 	end
-
-	-- File content may have changed between executions for the same cell/image index.
-	-- Drop cached object so snacks reloads fresh bytes from disk.
-	image_cache[path] = nil
-
-	-- Get or create snacks Image (handles sending image data to terminal)
-	local img = get_or_create_image(path)
 	if not img then
-		return nil, 0
-	end
-
-	-- Wait for image to be ready (it may need conversion)
-	local ready = vim.wait(500, function()
-		return img:ready() or img:failed()
-	end, 10)
-
-	if not ready or img:failed() then
-		return nil, 0
-	end
-
-	-- Get dimensions from snacks' converted image
-	local native_width_px, native_height_px
-	if img.info and img.info.size then
-		native_width_px = img.info.size.width
-		native_height_px = img.info.size.height
-	end
-	if not native_width_px or not native_height_px then
 		return nil, 0
 	end
 	local native_width_cells, native_height_cells = pixels_to_cells(native_width_px, native_height_px)
