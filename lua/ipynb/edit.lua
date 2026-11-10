@@ -186,8 +186,8 @@ local function refresh_edit_window(state)
   end
 
   if not vim.api.nvim_win_is_valid(edit.win) then
-    pcall(vim.api.nvim_del_augroup_by_name, edit_window_group_name(edit.buf))
-    state.edit_state = nil
+    -- Float was closed without M.close (e.g. :q); close() still flushes the edit buffer
+    M.close(state)
     return
   end
 
@@ -542,6 +542,60 @@ function M.open(state, mode)
   -- mode == nil: stay in normal mode at cursor position
 end
 
+---Push the edit buffer's text to cell.source, shadow and facade if they are out of date.
+---The TextChanged* autocmds can miss changes (e.g. text typed while a completion popup is
+---open fires TextChangedP instead of TextChangedI), so call this before anything reads
+---cell.source or the facade: save, execute, close, undo.
+---@param state NotebookState
+---@return boolean changed Whether anything had to be synced
+function M.flush(state)
+  local edit = state.edit_state
+  if state.skip_sync or not edit or not vim.api.nvim_buf_is_valid(edit.buf) then
+    return false
+  end
+  if not state.facade_buf or not vim.api.nvim_buf_is_valid(state.facade_buf) then
+    return false
+  end
+  local cell = state.cells[edit.cell_idx]
+  if not cell then
+    return false
+  end
+
+  local new_lines = vim.api.nvim_buf_get_lines(edit.buf, 0, -1, false)
+  local new_source = table.concat(new_lines, '\n')
+  local facade_lines = vim.api.nvim_buf_get_lines(state.facade_buf, edit.start_line, edit.end_line + 1, false)
+  if cell.source == new_source and vim.deep_equal(new_lines, facade_lines) then
+    return false
+  end
+
+  require('ipynb.lsp').sync_shadow_region(state, edit.start_line, edit.end_line + 1, new_lines, cell.type)
+  cell.source = new_source
+
+  local was_modifiable = vim.bo[state.facade_buf].modifiable
+  vim.bo[state.facade_buf].modifiable = true
+  set_facade_lines(state.facade_buf, edit.start_line, edit.end_line + 1, new_lines)
+  vim.bo[state.facade_buf].modifiable = was_modifiable
+  require('ipynb.lsp').refresh_facade_diagnostics(state)
+
+  edit.end_line = edit.start_line + #new_lines - 1
+  edit.last_changedtick = vim.api.nvim_buf_get_changedtick(edit.buf)
+
+  if #new_lines ~= #facade_lines then
+    require('ipynb.cells').place_markers(state)
+    require('ipynb.visuals').render_all(state)
+
+    local images_mod = require('ipynb.images')
+    if images_mod.is_available() then
+      images_mod.sync_positions(state)
+    end
+  end
+
+  if vim.api.nvim_win_is_valid(edit.win) then
+    refresh_edit_window(state)
+  end
+  return true
+end
+
 ---Setup real-time sync from edit buffer to facade and shadow
 ---Facade sync happens on InsertLeave for natural undo granularity (one undo per insert session)
 ---Shadow sync happens on every change for LSP responsiveness
@@ -649,12 +703,12 @@ function M.setup_sync(state, buf)
         return
       end
       local edit = state.edit_state --[[@as EditState]]
-      -- Only sync if TextChangedI actually fired (insert_synced == true means changes were made)
       local had_changes = edit.insert_synced
       -- Reset flag so next insert session gets fresh undo entry
       edit.insert_synced = false
-      if had_changes then
-        sync_facade()
+      -- Flush unconditionally: changes made while a completion popup was open never
+      -- reached TextChangedI, so neither insert_synced nor cell.source reflect them
+      if M.flush(state) or had_changes then
         -- Force undo break on facade so next insert session creates a new undo block
         vim.api.nvim_buf_call(state.facade_buf, function()
           vim.cmd('let &undolevels = &undolevels')
@@ -780,6 +834,20 @@ function M.setup_window_sync(state)
     callback = refresh_or_close,
   })
 
+  -- Closing the float directly (:q, :wq, <C-w>c) bypasses M.close; finish the session
+  -- properly so unsynced edits reach the facade and it becomes read-only again
+  local edit_win = edit.win
+  vim.api.nvim_create_autocmd('WinClosed', {
+    group = group,
+    pattern = tostring(edit_win),
+    callback = function()
+      vim.schedule(function()
+        if state.edit_state and state.edit_state.win == edit_win then
+          M.close(state)
+        end
+      end)
+    end,
+  })
 end
 
 ---Setup keymaps for edit float
@@ -971,6 +1039,9 @@ local function global_undo_redo(state, cmd)
     return
   end
 
+  -- Record unsynced edits first, otherwise the edit buffer refresh below discards them
+  M.flush(state)
+
   -- Check undo state before to see if anything changes
   local seq_before = vim.api.nvim_buf_call(state.facade_buf, function()
     return vim.fn.undotree().seq_cur
@@ -1096,10 +1167,9 @@ function M.close(state)
   local cell = state.cells[edit.cell_idx]
   local facade_valid = state.facade_buf and vim.api.nvim_buf_is_valid(state.facade_buf)
 
-  -- Update cell content in state
+  -- Sync any unsynced edits into cell.source and the facade
+  M.flush(state)
   if cell and vim.api.nvim_buf_is_valid(edit.buf) then
-    local lines = vim.api.nvim_buf_get_lines(edit.buf, 0, -1, false)
-    cell.source = table.concat(lines, '\n')
     -- Clear modified flag - content is synced to facade
     vim.bo[edit.buf].modified = false
   end

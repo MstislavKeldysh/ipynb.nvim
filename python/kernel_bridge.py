@@ -7,8 +7,12 @@ Uses jupyter_client to manage kernel connections.
 """
 
 import json
+import os
+import select
+import signal
 import sys
 import threading
+import time
 import queue
 import uuid
 from typing import Optional, Dict, Any
@@ -41,10 +45,31 @@ class KernelBridge:
         self.pending_input_requests: Dict[str, Dict[str, Any]] = {}
         self.running = True
         self.output_queue = queue.Queue()
+        self._stdout_lock = threading.Lock()
+        # Kernel death detection: the kernel process can crash (segfault, OOM kill)
+        # without any message on the channels, so poll the process while idle.
+        self._restarting = False
+        self._death_reported = False
+        # zmq sockets are not thread-safe: restart() reads IOPub itself (wait_for_ready),
+        # so it holds this lock to keep the listener thread off the socket meanwhile.
+        self._iopub_lock = threading.Lock()
 
     def send_message(self, msg: Dict[str, Any]):
-        """Send a JSON message to stdout."""
-        print(json.dumps(msg), flush=True)
+        """Send a JSON message to stdout.
+
+        Writes the raw fd under a lock so large payloads (e.g. images) survive
+        a non-blocking stdout (Julia kernels flip the inherited pipe to
+        O_NONBLOCK) and messages from different threads never interleave.
+        """
+        data = memoryview((json.dumps(msg) + "\n").encode("utf-8"))
+        fd = sys.stdout.fileno()
+        with self._stdout_lock:
+            while data:
+                try:
+                    n = os.write(fd, data)
+                    data = data[n:]
+                except BlockingIOError:
+                    select.select([], [fd], [])  # wait until Neovim drains the pipe
 
     def start_kernel(self, kernel_name: str = "python3") -> bool:
         """Start a new Jupyter kernel."""
@@ -119,13 +144,19 @@ class KernelBridge:
         """Start a thread to listen for iopub messages."""
         def listener():
             while self.running and self.kernel_client:
-                try:
-                    msg = self.kernel_client.get_iopub_msg(timeout=0.5)
-                    self._handle_iopub_message(msg)
-                except queue.Empty:
+                if self._restarting:
+                    time.sleep(0.05)
                     continue
+                try:
+                    with self._iopub_lock:
+                        try:
+                            msg = self.kernel_client.get_iopub_msg(timeout=0.5)
+                        except queue.Empty:
+                            self._check_kernel_death()
+                            continue
+                    self._handle_iopub_message(msg)
                 except Exception as e:
-                    if self.running:
+                    if self.running and not self._restarting:
                         self.send_message({
                             "type": "error",
                             "error": f"IOPub listener error: {str(e)}"
@@ -133,6 +164,23 @@ class KernelBridge:
 
         self.iopub_thread = threading.Thread(target=listener, daemon=True)
         self.iopub_thread.start()
+
+    def _check_kernel_death(self):
+        """Report (once) that the kernel process exited without being asked to."""
+        if self._restarting or self._death_reported or not self.running:
+            return
+        km = self.kernel_manager
+        if not km or not km.has_kernel or km.is_alive():
+            return
+        exit_code = None
+        try:
+            exit_code = km.provisioner.process.poll()
+        except Exception:
+            pass
+        self._death_reported = True
+        self.pending_executions.clear()
+        self.pending_input_requests.clear()
+        self.send_message({"type": "kernel_died", "exit_code": exit_code})
 
     def _start_stdin_listener(self):
         """Start a thread to listen for stdin messages."""
@@ -357,18 +405,23 @@ class KernelBridge:
     def restart(self):
         """Restart the kernel."""
         if self.kernel_manager:
+            self._restarting = True
             try:
-                self.kernel_manager.restart_kernel()
-                self.kernel_client.wait_for_ready(timeout=30)
+                with self._iopub_lock:
+                    self.kernel_manager.restart_kernel()
+                    self.kernel_client.wait_for_ready(timeout=30)
                 self.execution_count = 0
                 self.pending_executions.clear()
                 self.pending_input_requests.clear()
+                self._death_reported = False
                 self.send_message({"type": "restarted"})
             except Exception as e:
                 self.send_message({
                     "type": "error",
                     "error": f"Failed to restart: {str(e)}"
                 })
+            finally:
+                self._restarting = False
 
     def shutdown(self):
         """Shutdown the kernel."""
@@ -520,6 +573,17 @@ class KernelBridge:
 def main():
     """Main entry point - read commands from stdin, send responses to stdout."""
     bridge = KernelBridge()
+
+    # Neovim stops jobs with SIGTERM (SIGHUP if the terminal goes away). Python's default
+    # handling exits without running the `finally` below, which orphans the kernel process.
+    def _terminate(signum, frame):
+        try:
+            bridge.shutdown()
+        finally:
+            os._exit(0)
+
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGHUP, _terminate)
 
     # Signal ready
     bridge.send_message({"type": "ready"})

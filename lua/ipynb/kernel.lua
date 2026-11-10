@@ -140,6 +140,85 @@ local function resolve_message_cell(state, msg)
   return nil, nil
 end
 
+---Human-readable restart key from config (e.g. '\k0')
+---@return string
+local function restart_hint()
+  local lhs = require("ipynb.config").get().keymaps.kernel_restart
+  local leader = vim.g.mapleader or "\\"
+  if leader == " " then
+    leader = "<Space>"
+  end
+  local key = lhs and lhs ~= "" and (lhs:gsub("<leader>", function() return leader end)) or nil
+  return key and (key .. " or :NotebookKernelRestart") or ":NotebookKernelRestart"
+end
+
+---Describe a kernel process exit code (negative = killed by signal)
+---@param code number|nil
+---@return string
+local function describe_exit(code)
+  if type(code) ~= "number" then
+    return "process exited"
+  end
+  if code < 0 then
+    local signals = {
+      [6] = "aborted (SIGABRT)",
+      [9] = "killed (SIGKILL), often the out-of-memory killer",
+      [11] = "segmentation fault (SIGSEGV)",
+    }
+    return signals[-code] or ("killed by signal " .. -code)
+  end
+  return "exited with code " .. code
+end
+
+---Mark the kernel dead, flag the cell that was running, and tell the user
+---@param state NotebookState
+---@param exit_code number|nil
+local function handle_kernel_death(state, exit_code)
+  local kernel = state.kernel
+  kernel.connected = false
+  kernel.dead = true
+  kernel.execution_state = "dead"
+  local running_id = kernel.running_cell_id
+  local pending = kernel.pending_cells
+  kernel.running_cell_id = nil
+  kernel.pending_cells = {}
+
+  vim.schedule(function()
+    close_input_prompt(state)
+    local reason = describe_exit(exit_code)
+    local running_idx
+
+    -- Cells stuck as busy/queued never finished; clear their spinners
+    for id in pairs(pending) do
+      local idx, cell = resolve_message_cell(state, { cell_id = id })
+      if cell then
+        cell.execution_state = nil
+        if id == running_id then
+          running_idx = idx
+        end
+      end
+    end
+
+    if running_idx then
+      local output_mod = require("ipynb.output")
+      output_mod.append_output(state.cells[running_idx], {
+        output_type = "error",
+        ename = "KernelDied",
+        evalue = "the kernel died while running this cell: " .. reason,
+        traceback = { "All variables are lost. Restart the kernel with " .. restart_hint() .. "." },
+      })
+      output_mod.render_outputs(state, running_idx)
+    end
+    require("ipynb.visuals").render_all(state)
+
+    local where = running_idx and (" while running cell " .. running_idx) or ""
+    vim.notify(
+      "Kernel died" .. where .. ": " .. reason .. ". Restart with " .. restart_hint() .. ".",
+      vim.log.levels.ERROR
+    )
+  end)
+end
+
 ---Set the notebook language (updates metadata, treesitter, and LSP)
 ---@param state NotebookState
 ---@param lang string Language name (e.g., "python", "julia", "r")
@@ -238,12 +317,21 @@ local function handle_message(state, msg)
     if target_idx then
       update_cell_field(state, target_idx, "execution_state", msg.state)
     end
+    if msg.state == "busy" and type(msg.cell_id) == "string" then
+      kernel.running_cell_id = msg.cell_id
+    end
     if msg.state == "idle" then
       close_input_prompt(state)
       if msg.cell_id and type(msg.cell_id) == "string" then
         kernel.pending_cells[msg.cell_id] = nil
+        if kernel.running_cell_id == msg.cell_id then
+          kernel.running_cell_id = nil
+        end
       end
     end
+
+  elseif msg_type == "kernel_died" then
+    handle_kernel_death(state, msg.exit_code)
 
   elseif msg_type == "input_request" then
     if type(msg.request_id) ~= "string" or msg.request_id == "" then
@@ -295,6 +383,9 @@ local function handle_message(state, msg)
     end)
 
   elseif msg_type == "restarted" then
+    kernel.connected = true
+    kernel.dead = false
+    kernel.running_cell_id = nil
     kernel.execution_state = "idle"
     kernel.pending_cells = {}
     close_input_prompt(state)
@@ -553,6 +644,13 @@ function M.connect(state, opts)
     return true
   end
 
+  -- The bridge outlives a crashed kernel; restart through it instead of starting a second one
+  if state.kernel and state.kernel.dead and state.kernel.job_id then
+    vim.notify('Restarting dead kernel...', vim.log.levels.INFO)
+    M.restart(state)
+    return true
+  end
+
   if not M.start_bridge(state, opts.python_path) then
     return false
   end
@@ -589,10 +687,17 @@ end
 ---@param cell_idx number
 ---@return boolean success
 function M.execute(state, cell_idx)
+  if state.kernel and state.kernel.dead then
+    vim.notify("Kernel is dead (it crashed). Restart it with " .. restart_hint() .. ".", vim.log.levels.ERROR)
+    return false
+  end
   if not state.kernel or not state.kernel.connected then
     vim.notify("No kernel connected. Use :NotebookKernelStart", vim.log.levels.WARN)
     return false
   end
+
+  -- Make sure cell.source matches what is shown in an open edit float
+  require("ipynb.edit").flush(state)
 
   local cell = state.cells[cell_idx]
   if not cell or cell.type ~= "code" then
@@ -761,6 +866,8 @@ function M.statusline(state)
     else
       return icon .. ' IDLE', 'ready'
     end
+  elseif state.kernel and state.kernel.dead then
+    return icon .. ' DEAD', 'disconnected'
   else
     return icon .. ' DISC', 'disconnected'
   end

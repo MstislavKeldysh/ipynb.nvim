@@ -300,8 +300,8 @@ end
 function M.open_notebook(buf, path)
   local cells, metadata, cell_ids
 
-  -- Check if file exists
-  if vim.fn.filereadable(path) == 1 then
+  -- Check if file exists and is non-empty (a 0-byte file, e.g. from `touch`, is not valid JSON)
+  if vim.fn.filereadable(path) == 1 and vim.fn.getfsize(path) > 0 then
     -- Read existing notebook
     cells, metadata, cell_ids = M.read_ipynb(path)
   else
@@ -357,6 +357,9 @@ function M.save_notebook(buf, path)
   end
 
   path = path or state.source_path
+
+  -- Flush an open edit float first; the facade may not have its latest text yet
+  require('ipynb.edit').flush(state)
 
   -- Sync cells from facade buffer
   local cells_mod = require('ipynb.cells')

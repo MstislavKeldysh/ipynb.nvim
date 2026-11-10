@@ -327,6 +327,17 @@ function M.render_outputs(state, cell_idx, skip_image_render)
     end
   end
 
+  -- Neovim cannot scroll into a block of virt_lines taller than the window: it jumps from the
+  -- first screenful to the last, so the middle (often whole figures) is never visible.
+  -- Point at the output viewer, which uses real lines and scrolls normally.
+  local facade_win = vim.fn.bufwinid(state.facade_buf)
+  if facade_win ~= -1 and #virt_lines > vim.api.nvim_win_get_height(facade_win) - 3 then
+    local km = require('ipynb.config').get().keymaps or {}
+    table.insert(virt_lines, 2, {
+      { '┄ taller than the window: ' .. (km.open_output or '<leader>ko') .. ' to scroll through it ┄', 'IpynbBorder' },
+    })
+  end
+
   -- Create single extmark with all virt_lines (text + images interleaved)
   -- Order is guaranteed by array order
   if #virt_lines > 0 then
@@ -417,8 +428,55 @@ function M.open_output_float(state, cell_idx)
     return
   end
 
-  -- Build plain text output
-  local lines = M.build_output_text(cell)
+  -- Images are drawn as real buffer lines here (not virt_lines), so a figure taller than the
+  -- window can be scrolled through row by row.
+  local images_mod = require('ipynb.images')
+  local has_images = false
+  if images_mod.supports_placeholders() then
+    for _, output in ipairs(cell.outputs) do
+      if images_mod.get_image_data(output) then
+        has_images = true
+        break
+      end
+    end
+  end
+
+  local width = has_images and math.floor(vim.o.columns * 0.9) or math.min(100, math.floor(vim.o.columns * 0.8))
+
+  -- Build the lines in output order: text as is, figures as placeholder rows
+  local lines = {} ---@type string[]
+  local text_lines = {} ---@type string[] Text only, for yanking
+  local image_rows = {} ---@type table<number, string> Line number -> placeholder highlight group
+  local placements = {} ---@type table[] Images to free when the float closes
+  local image_index = 0
+
+  for _, output in ipairs(cell.outputs) do
+    local shown = false
+    if has_images and images_mod.get_image_data(output) then
+      image_index = image_index + 1
+      local entries = images_mod.get_image_virt_lines(state, cell, output, image_index, {
+        view = true,
+        max_width = width - 2,
+        max_height = math.huge,
+        collect = placements,
+      })
+      if entries then
+        for _, entry in ipairs(entries) do
+          table.insert(lines, entry[1][1])
+          image_rows[#lines] = entry[1][2]
+        end
+        table.insert(lines, '')
+        shown = true
+      end
+    end
+    if not shown then
+      for _, line in ipairs(M.build_output_text({ outputs = { output } })) do
+        table.insert(lines, line)
+        table.insert(text_lines, line)
+      end
+    end
+  end
+
   if #lines == 0 then
     vim.notify('No text output for this cell', vim.log.levels.INFO)
     return
@@ -428,6 +486,25 @@ function M.open_output_float(state, cell_idx)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 
+  if has_images then
+    local ns = vim.api.nvim_create_namespace('ipynb_output_float')
+    for row, hl_group in pairs(image_rows) do
+      vim.api.nvim_buf_set_extmark(buf, ns, row - 1, 0, {
+        end_row = row - 1,
+        end_col = #lines[row],
+        hl_group = hl_group,
+        priority = 200,
+      })
+    end
+    vim.api.nvim_create_autocmd('BufWipeout', {
+      buffer = buf,
+      once = true,
+      callback = function()
+        images_mod.release(placements)
+      end,
+    })
+  end
+
   -- Buffer settings
   vim.bo[buf].buftype = 'nofile'
   vim.bo[buf].bufhidden = 'wipe'
@@ -435,15 +512,16 @@ function M.open_output_float(state, cell_idx)
   vim.bo[buf].filetype = 'notebook_output'
 
   -- Calculate float dimensions
-  local width = math.min(100, math.floor(vim.o.columns * 0.8))
-  local height = math.min(#lines + 2, math.floor(vim.o.lines * 0.7))
+  local height = math.min(#lines + 2, math.floor(vim.o.lines * (has_images and 0.9 or 0.7)))
 
-  -- Find max line width for better sizing
-  local max_line_width = 0
-  for _, line in ipairs(lines) do
-    max_line_width = math.max(max_line_width, vim.fn.strdisplaywidth(line))
+  -- Find max line width for better sizing (placeholder rows are sized to `width` already)
+  if not has_images then
+    local max_line_width = 0
+    for _, line in ipairs(lines) do
+      max_line_width = math.max(max_line_width, vim.fn.strdisplaywidth(line))
+    end
+    width = math.min(math.max(width, max_line_width + 4), vim.o.columns - 4)
   end
-  width = math.min(math.max(width, max_line_width + 4), vim.o.columns - 4)
 
   -- Center the float
   local row = math.floor((vim.o.lines - height) / 2)
@@ -460,12 +538,14 @@ function M.open_output_float(state, cell_idx)
     border = 'rounded',
     title = ' Cell Output [' .. cell_idx .. '] ',
     title_pos = 'center',
+    footer = has_images and ' j/k <C-d>/<C-u> scroll · q close ' or nil,
+    footer_pos = has_images and 'center' or nil,
   })
 
-  -- Window settings
-  vim.wo[win].wrap = true
-  vim.wo[win].cursorline = true
-  vim.wo[win].number = true
+  -- Window settings (placeholder rows must not wrap, and cursorline would recolor them)
+  vim.wo[win].wrap = not has_images
+  vim.wo[win].cursorline = not has_images
+  vim.wo[win].number = not has_images
 
   -- Keymaps for the output float
   local close = function()
@@ -481,7 +561,7 @@ function M.open_output_float(state, cell_idx)
 
   -- Yank all output
   vim.keymap.set('n', 'Y', function()
-    local all_text = table.concat(lines, '\n')
+    local all_text = table.concat(text_lines, '\n')
     vim.fn.setreg('+', all_text)
     vim.fn.setreg('"', all_text)
     vim.notify('Output copied to clipboard', vim.log.levels.INFO)

@@ -296,9 +296,13 @@ end
 ---@param cell table Cell object
 ---@param output table Output object containing image data
 ---@param image_index number Index of this image (1-based, for cache filename)
+---@param opts { view: boolean|nil, max_width: number|nil, max_height: number|nil, collect: table[]|nil }|nil
+---       Overrides for the output viewer float: `view` uses separate cache files, `max_width`/`max_height`
+---       replace the window-based limits (math.huge = never shrink to fit), and `collect` receives the
+---       placement so the caller can free it with M.release() instead of it being tracked on the state.
 ---@return table[]|nil virt_line_entries Array of virt_line entries, or nil if failed
 ---@return number height Height of the image in terminal rows
-function M.get_image_virt_lines(state, cell, output, image_index)
+function M.get_image_virt_lines(state, cell, output, image_index, opts)
 	if not M.supports_placeholders() then
 		return nil, 0
 	end
@@ -330,7 +334,7 @@ function M.get_image_virt_lines(state, cell, output, image_index)
 	local cache_dir = get_cache_dir()
 	local ext = MIME_EXTENSIONS[mime] or "png"
 	local data_hash = vim.fn.sha256(image_data):sub(1, 12)
-	local filename = string.format("%s-%d-%s.%s", cell_id, image_index, data_hash, ext)
+	local filename = string.format("%s-%d-%s%s.%s", cell_id, image_index, data_hash, opts and opts.view and "-view" or "", ext)
 	local path = cache_dir .. "/" .. filename
 
 	if not write_binary_file(path, file_content) then
@@ -396,6 +400,11 @@ function M.get_image_virt_lines(state, cell, output, image_index)
 		max_img_height = img_config.max_height or (vim.o.lines - height_padding)
 	end
 
+	if opts then
+		text_width = opts.max_width or text_width
+		max_img_height = opts.max_height or max_img_height
+	end
+
 	-- Calculate scaled dimensions
 	local img_width = native_width_cells or text_width
 	local img_height = native_height_cells or max_img_height
@@ -439,15 +448,41 @@ function M.get_image_virt_lines(state, cell, output, image_index)
 	end
 
 	-- Track for cleanup
-	state.images = state.images or {}
-	state.images[cell_id] = state.images[cell_id] or {}
-	table.insert(state.images[cell_id], {
+	local entry = {
 		img = img,
 		placement_id = placement_id,
 		path = path,
-	})
+	}
+	if opts and opts.collect then
+		table.insert(opts.collect, entry)
+	else
+		state.images = state.images or {}
+		state.images[cell_id] = state.images[cell_id] or {}
+		table.insert(state.images[cell_id], entry)
+	end
 
 	return virt_line_entries, img_height
+end
+
+---Free images created for the output viewer (see the `collect` option of get_image_virt_lines)
+---Uses d=I so the terminal also drops the image data, not just the placement.
+---@param entries table[]|nil Entries collected by get_image_virt_lines
+function M.release(entries)
+	local ok, Snacks = pcall(require, "snacks")
+	for _, entry in ipairs(entries or {}) do
+		if entry.path then
+			image_cache[entry.path] = nil
+			pcall(vim.fn.delete, entry.path)
+		end
+		if ok and Snacks.image and Snacks.image.terminal and entry.img and entry.placement_id then
+			pcall(Snacks.image.terminal.request, {
+				a = "d",
+				d = "I",
+				i = entry.img.id,
+				p = entry.placement_id,
+			})
+		end
+	end
 end
 
 ---Clear images for a cell
