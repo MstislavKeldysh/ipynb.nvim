@@ -266,6 +266,27 @@ function M.build_output_text(cell)
   return lines
 end
 
+---Delete every output extmark on a cell's anchor row, not just the one remembered on the cell.
+---Overlapping renders used to leave extra blocks behind that nothing tracked or removed, stacking
+---copies of the output (whose image placements had already been deleted, so they showed blank).
+---@param state NotebookState
+---@param cell_idx number
+local function delete_output_extmarks(state, cell_idx)
+  local cell = state.cells[cell_idx]
+  if cell and cell.output_extmark then
+    pcall(vim.api.nvim_buf_del_extmark, state.facade_buf, output_ns, cell.output_extmark)
+    cell.output_extmark = nil
+  end
+
+  local ok, _, end_line = pcall(require('ipynb.cells').get_cell_range, state, cell_idx)
+  if ok and end_line then
+    local marks = vim.api.nvim_buf_get_extmarks(state.facade_buf, output_ns, { end_line, 0 }, { end_line, -1 }, {})
+    for _, mark in ipairs(marks) do
+      pcall(vim.api.nvim_buf_del_extmark, state.facade_buf, output_ns, mark[1])
+    end
+  end
+end
+
 ---Render outputs for a cell as virtual lines with true text/image interleaving
 ---All outputs (text and images) are combined into a single extmark's virt_lines
 ---This guarantees correct ordering: text1 → img1 → text2 → img2 → etc.
@@ -282,11 +303,8 @@ function M.render_outputs(state, cell_idx, skip_image_render)
   local images_mod = require('ipynb.images')
   local _, end_line = cells_mod.get_cell_range(state, cell_idx)
 
-  -- Clear old extmark for this cell
-  if cell.output_extmark then
-    pcall(vim.api.nvim_buf_del_extmark, state.facade_buf, output_ns, cell.output_extmark)
-    cell.output_extmark = nil
-  end
+  -- Clear old extmark(s) for this cell
+  delete_output_extmarks(state, cell_idx)
 
   -- Clear existing images
   if cell.id then
@@ -365,11 +383,8 @@ function M.clear_outputs(state, cell_idx)
     images_mod.clear_images(state, cell.id)
   end
 
-  -- Clear output extmark
-  if cell.output_extmark then
-    pcall(vim.api.nvim_buf_del_extmark, state.facade_buf, output_ns, cell.output_extmark)
-    cell.output_extmark = nil
-  end
+  -- Clear output extmark(s)
+  delete_output_extmarks(state, cell_idx)
 
   cell.outputs = {}
   cell._stream_state = nil
@@ -391,6 +406,14 @@ end
 ---Render all cell outputs
 ---@param state NotebookState
 function M.render_all(state)
+  -- Start from a clean slate. Re-reading the buffer (e.g. :edit!) builds a new state that knows
+  -- nothing about the output extmarks the previous state placed, so without this every reload
+  -- stacked another full set of output blocks on top of the old ones.
+  vim.api.nvim_buf_clear_namespace(state.facade_buf, output_ns, 0, -1)
+  for _, cell in ipairs(state.cells) do
+    cell.output_extmark = nil
+  end
+
   -- Render each cell's outputs fully (including images) before moving to next cell
   -- This maintains correct text/image interleaving within each cell
   for i, cell in ipairs(state.cells) do

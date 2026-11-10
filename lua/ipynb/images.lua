@@ -194,11 +194,55 @@ local function write_binary_file(path, data)
 	return ok_write ~= nil
 end
 
+---Make sure a cache file with this content exists, without touching it if it already does.
+---Snacks hands kitty the file *path* (t=f), and kitty reads it whenever it gets to the command. A
+---file that is deleted or truncated and rewritten in between (every re-render used to do that, and a
+---cell's outputs trigger several in quick succession) leaves kitty with nothing for that image id,
+---while snacks believes it was sent, so the figure stays blank. The file name contains a hash of the
+---data, so a file of the right size is the right file.
+---@param path string File path
+---@param data string Binary data
+---@return boolean success
+local function ensure_file(path, data)
+	local uv = vim.uv or vim.loop
+	local stat = uv.fs_stat(path)
+	if stat and stat.size == #data then
+		return true
+	end
+	return write_binary_file(path, data)
+end
+
+local purged_cache = false
+
+---Delete cache files older than a day, once per session. Files are no longer deleted when a cell is
+---re-rendered (see ensure_file), so this keeps the folder from growing without bound.
+---@param dir string Cache directory
+local function purge_old_cache(dir)
+	if purged_cache then
+		return
+	end
+	purged_cache = true
+
+	local uv = vim.uv or vim.loop
+	local cutoff = os.time() - 24 * 60 * 60
+	for name, kind in vim.fs.dir(dir) do
+		local ext = name:match("%.(%w+)$")
+		if kind == "file" and ext and vim.tbl_contains(vim.tbl_values(MIME_EXTENSIONS), ext) then
+			local path = dir .. "/" .. name
+			local stat = uv.fs_stat(path)
+			if stat and stat.mtime.sec < cutoff then
+				uv.fs_unlink(path)
+			end
+		end
+	end
+end
+
 -- Storage for snacks Image objects (keep them alive for the terminal protocol)
 local image_cache = {} ---@type table<string, snacks.Image>
 
--- Makes retry file names unique (see get_image_virt_lines)
+-- Make retry and viewer file names unique (see get_image_virt_lines)
 local retry_counter = 0
+local view_counter = 0
 
 ---Get or create a snacks Image object for a file path
 ---@param path string Path to image file
@@ -335,9 +379,17 @@ function M.get_image_virt_lines(state, cell, output, image_index, opts)
 
 	-- Write to cache file
 	local cache_dir = get_cache_dir()
+	purge_old_cache(cache_dir)
 	local ext = MIME_EXTENSIONS[mime] or "png"
 	local data_hash = vim.fn.sha256(image_data):sub(1, 12)
-	local filename = string.format("%s-%d-%s%s.%s", cell_id, image_index, data_hash, opts and opts.view and "-view" or "", ext)
+	-- The viewer frees its images in the terminal when it closes, but snacks keeps its Image object (and
+	-- believes it is still sent) for that path, so every viewer image gets a path of its own.
+	local view_tag = ""
+	if opts and opts.view then
+		view_counter = view_counter + 1
+		view_tag = string.format("-view%d-%d", vim.fn.getpid(), view_counter)
+	end
+	local filename = string.format("%s-%d-%s%s.%s", cell_id, image_index, data_hash, view_tag, ext)
 	local path = cache_dir .. "/" .. filename
 
 	-- Snacks keeps every Image object in a session-long table keyed by file path. One that failed, or
@@ -348,18 +400,18 @@ function M.get_image_virt_lines(state, cell, output, image_index, opts)
 	local img, native_width_px, native_height_px
 	for attempt = 0, 2 do
 		if attempt > 0 then
+			-- Leave the abandoned file alone: snacks may still send it, and kitty has to be able to read it
 			image_cache[path] = nil
-			pcall(vim.fn.delete, path)
 			retry_counter = retry_counter + 1
 			path = string.format("%s/%s-r%d-%d.%s", cache_dir, base_name, vim.fn.getpid(), retry_counter, ext)
 		end
 
-		if not write_binary_file(path, file_content) then
+		if not ensure_file(path, file_content) then
 			return nil, 0
 		end
 
-		-- File content may have changed between executions for the same cell/image index.
-		-- Drop cached object so snacks reloads fresh bytes from disk.
+		-- Drop our cached object so a fresh one is looked up (the file name carries a hash of the
+		-- data, so changed content always means a different path).
 		image_cache[path] = nil
 
 		-- Get or create snacks Image (handles sending image data to terminal)
@@ -511,8 +563,9 @@ function M.clear_images(state, cell_id)
 	if ok and Snacks.image and Snacks.image.terminal then
 		for _, entry in ipairs(state.images[cell_id]) do
 			if entry.path then
+				-- Keep the file: kitty may not have read it yet (see ensure_file). Old files are
+				-- purged by age instead.
 				image_cache[entry.path] = nil
-				pcall(vim.fn.delete, entry.path)
 			end
 			if entry.img and entry.placement_id then
 				pcall(Snacks.image.terminal.request, {
