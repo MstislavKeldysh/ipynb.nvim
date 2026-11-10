@@ -1,3 +1,11 @@
+This is a fork, where I vibe code fixes to various bugs I encounter as I use the original ipynb.nvim package.
+
+So far fixed:
+
+- Can now display figures larger than space in terminal
+- Fixed some issues with output not updating if you alt tab & the kernel crashing for no reason
+
+
 # 📘 `ipynb.nvim`
 
 A modal Jupyter notebook editor for Neovim.
