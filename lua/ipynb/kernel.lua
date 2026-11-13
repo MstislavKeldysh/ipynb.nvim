@@ -170,6 +170,29 @@ local function describe_exit(code)
   return "exited with code " .. code
 end
 
+---Clear the running/queued marker of every cell.
+---When the kernel drops its queue (interrupt, restart, shutdown) no "idle" status follows for the
+---cells that were still pending, so without this they keep their [*] spinner forever.
+---@param state NotebookState
+local function clear_cell_states(state)
+  vim.schedule(function()
+    -- The notebook may have been closed in the meantime (shutdown also runs when its buffer unloads)
+    if not (state.facade_buf and vim.api.nvim_buf_is_loaded(state.facade_buf)) then
+      return
+    end
+    local changed = false
+    for _, cell in ipairs(state.cells or {}) do
+      if cell.execution_state == "busy" or cell.execution_state == "queued" then
+        cell.execution_state = nil
+        changed = true
+      end
+    end
+    if changed then
+      require("ipynb.visuals").render_all(state)
+    end
+  end)
+end
+
 ---Mark the kernel dead, flag the cell that was running, and tell the user
 ---@param state NotebookState
 ---@param exit_code number|nil
@@ -377,6 +400,7 @@ local function handle_message(state, msg)
   elseif msg_type == "interrupted" then
     kernel.execution_state = "idle"
     kernel.pending_cells = {}
+    clear_cell_states(state)
     close_input_prompt(state)
     vim.schedule(function()
       vim.notify("Kernel interrupted", vim.log.levels.INFO)
@@ -388,6 +412,7 @@ local function handle_message(state, msg)
     kernel.running_cell_id = nil
     kernel.execution_state = "idle"
     kernel.pending_cells = {}
+    clear_cell_states(state)
     close_input_prompt(state)
     vim.schedule(function()
       vim.notify("Kernel restarted", vim.log.levels.INFO)
@@ -397,6 +422,7 @@ local function handle_message(state, msg)
     kernel.connected = false
     kernel.execution_state = "idle"
     kernel.pending_cells = {}
+    clear_cell_states(state)
     close_input_prompt(state)
 
   elseif msg_type == "error" then
@@ -555,6 +581,7 @@ function M.start_bridge(state, python_path)
         state.kernel.job_id = nil
         state.kernel.connected = false
       end
+      clear_cell_states(state)
       vim.schedule(function()
         close_input_prompt(state)
         if code ~= 0 then
@@ -792,6 +819,7 @@ function M.shutdown(state)
   if state.kernel then
     state.kernel.connected = false
   end
+  clear_cell_states(state)
 end
 
 ---Check if kernel is connected for a notebook
