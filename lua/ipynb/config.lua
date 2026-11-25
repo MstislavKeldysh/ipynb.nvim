@@ -38,6 +38,7 @@ local M = {}
 ---@field jump_to_cell string Open cell picker (default: '<leader>kj')
 ---@field add_cell_above string Add cell above (default: '<leader>ka')
 ---@field add_cell_below string Add cell below (default: '<leader>kb')
+---@field delete_cell string Delete current cell (default: '<leader>kd')
 ---@field make_markdown string Make cell markdown (default: '<leader>km')
 ---@field make_code string Make cell code (default: '<leader>ky')
 ---@field make_raw string Make cell raw (default: '<leader>kr')
@@ -133,6 +134,7 @@ M.defaults = {
 		-- <leader>k menu (notebook operations)
 		add_cell_above = "<leader>ka",
 		add_cell_below = "<leader>kb",
+		delete_cell = "<leader>kd",
 		make_markdown = "<leader>km",
 		make_code = "<leader>ky",
 		make_raw = "<leader>kr",

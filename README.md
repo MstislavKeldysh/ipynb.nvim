@@ -243,6 +243,7 @@ require("ipynb").setup({
     -- Cell operations (both Notebook mode and Cell mode)
     add_cell_above = "<leader>ka", -- insert cell above
     add_cell_below = "<leader>kb", -- insert cell below
+    delete_cell = "<leader>kd",    -- delete current cell (Notebook mode only)
     make_markdown = "<leader>km",  -- convert to markdown cell
     make_code = "<leader>ky",      -- convert to code cell
     make_raw = "<leader>kr",       -- convert to raw cell
@@ -348,7 +349,7 @@ require("ipynb").setup({
 | `:NotebookJumpToCell` | Open cell picker | `jump_to_cell` | `<leader>kj` |
 | `:NotebookInsertCellBelow` | Insert cell below | `add_cell_below` | `<leader>kb` |
 | `:NotebookInsertCellAbove` | Insert cell above | `add_cell_above` | `<leader>ka` |
-| `:NotebookDeleteCell` | Delete current cell | | |
+| `:NotebookDeleteCell` | Delete current cell | `delete_cell` | `<leader>kd` |
 | `:NotebookCutCell` | Cut cell to register | `cut_cell` | `dd` |
 | `:NotebookPasteCellBelow` | Paste cell below | `paste_cell_below` | `p` |
 | `:NotebookPasteCellAbove` | Paste cell above | `paste_cell_above` | `P` |

@@ -43,6 +43,7 @@ local function register_which_key()
     -- Cell operations
     { km.add_cell_above, desc = "Cell add above", icon = "󰐕" },
     { km.add_cell_below, desc = "Cell add below", icon = "󰐕" },
+    { km.delete_cell, desc = "Cell delete", icon = "󰆴" },
     { km.make_code, desc = "Cell type: code", icon = "" },
     { km.make_markdown, desc = "Cell type: markdown", icon = "󰽛" },
     { km.make_raw, desc = "Cell type: raw", icon = "󰦨" },
@@ -186,6 +187,9 @@ function M.setup_facade_keymaps(state)
   vim.keymap.set('n', km.add_cell_below, function()
     M.add_cell_below(state)
   end, vim.tbl_extend('force', opts, { desc = 'Cell add below' }))
+
+  set_keymap_if_configured('n', km.delete_cell, '<Cmd>NotebookDeleteCell<CR>',
+    vim.tbl_extend('force', opts, { desc = 'Cell delete' }))
 
   vim.keymap.set('n', km.make_markdown, function()
     M.set_cell_type(state, 'markdown')
